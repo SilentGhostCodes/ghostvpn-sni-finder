@@ -1,0 +1,1 @@
+# ghostvpn-sni-finder
