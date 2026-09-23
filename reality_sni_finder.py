@@ -17,7 +17,7 @@ import urllib.request
 from pathlib import Path
 
 
-COUNTRIES = {"DE": "Q183", "NL": "Q55", "FI": "Q33", "SE": "Q34", "US": "Q30"}
+KNOWN_COUNTRIES = {"DE": "Q183", "NL": "Q55", "FI": "Q33", "SE": "Q34", "US": "Q30"}
 LARGE_DOMAINS = {
     "google.com", "google.de", "youtube.com", "facebook.com", "instagram.com",
     "cloudflare.com", "hetzner.com", "netcup.com", "microsoft.com",
@@ -47,7 +47,7 @@ def location(ip, timeout):
     for resource in data.get("located_resources", []):
         for loc in resource.get("locations", []):
             country = loc.get("country", "")
-            if isinstance(country, str) and country.upper() in COUNTRIES:
+            if isinstance(country, str) and len(country) == 2 and country.isalpha():
                 return country.upper(), loc.get("city", "") or ""
     return "", ""
 
@@ -76,10 +76,25 @@ def blocked(domain, excluded):
     return any(domain == root or domain.endswith("." + root) for root in excluded)
 
 
+def country_qid(country, timeout):
+    if country in KNOWN_COUNTRIES:
+        return KNOWN_COUNTRIES[country]
+    query = f'SELECT ?country WHERE {{ ?country wdt:P297 "{country}" . }} LIMIT 1'
+    url = WIKIDATA + "?" + urllib.parse.urlencode({"query": query, "format": "json"})
+    rows = request_json(url, max(30, timeout))["results"]["bindings"]
+    if not rows:
+        raise ValueError(f"No country in Wikidata for ISO code {country}; try --domains sites.txt")
+    qid = rows[0]["country"]["value"].rsplit("/", 1)[-1]
+    if not qid.startswith("Q") or not qid[1:].isdigit():
+        raise ValueError(f"Unexpected Wikidata country identifier: {qid}")
+    return qid
+
+
 def discover(country, limit, offset, timeout):
+    qid = country_qid(country, timeout)
     query = (
         "SELECT DISTINCT ?website WHERE { "
-        f"?org wdt:P17 wd:{COUNTRIES[country]} ; wdt:P856 ?website . "
+        f"?org wdt:P17 wd:{qid} ; wdt:P856 ?website . "
         'FILTER(STRSTARTS(STR(?website), "https://")) '
         f"}} LIMIT {limit} OFFSET {offset}"
     )
@@ -182,7 +197,7 @@ def score(row, country):
 def main():
     parser = argparse.ArgumentParser(description="Discover and compare REALITY target/SNI candidates from a VPS")
     parser.add_argument("--server-ip", help="Public IPv4; detected automatically when omitted")
-    parser.add_argument("--country", choices=COUNTRIES, help="Override detected country")
+    parser.add_argument("--country", help="Override detected country with a two-letter ISO code, e.g. NL")
     parser.add_argument("--domains", help="Use newline-separated domains or a previous result CSV")
     parser.add_argument("--exclude", help="Newline-separated domains to exclude")
     parser.add_argument("--limit", type=int, default=300, help="Wikidata records to fetch (default 300)")
@@ -207,9 +222,9 @@ def main():
         ipaddress.IPv4Address(server_ip)
         server_asns, prefix = network_info(server_ip, args.timeout)
         detected_country, city = location(server_ip, args.timeout)
-        country = args.country or detected_country
-        if not args.domains and country not in COUNTRIES:
-            raise ValueError("Country could not be detected; pass --country DE (or NL/FI/SE/US)")
+        country = (args.country or detected_country).upper()
+        if not args.domains and (len(country) != 2 or not country.isalpha()):
+            raise ValueError("Country could not be detected; pass an ISO code, e.g. --country NL")
         print(f"Server: {server_ip} | ASN: {','.join(server_asns) or '?'} | prefix: {prefix or '?'}")
         print(f"GeoIP: {detected_country or '?'} {city or ''} | search country: {country or '?'}")
 

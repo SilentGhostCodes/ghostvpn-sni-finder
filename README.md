@@ -5,24 +5,25 @@ Find public HTTPS domains that may be suitable as `target` and `serverNames` for
 ## Run
 
 ```bash
-unzip ghostvpn-sni-finder.zip
+git clone https://github.com/SilentGhostCodes/ghostvpn-sni-finder.git
 cd ghostvpn-sni-finder
 sh run.sh
 ```
 
-After GitHub publication, `git clone <repository-url>` can replace the unzip step.
-
 The script detects the VPS public IPv4, ASN, prefix, and approximate country. It fetches official sites of organizations in that country from Wikidata, skips a small list of major domains, checks certificate validation, TLS 1.3, HTTP/2, redirects, ASN and GeoIP, and prints a best candidate. It saves all passed candidates to `sni-results-IP.csv`.
+
+Country detection supports two-letter ISO country codes worldwide. For codes beyond a small built-in cache, the script asks Wikidata to resolve the code. A country must have enough listed official sites that pass the network checks; some countries may yield no candidates.
 
 ```bash
 sh run.sh --server-ip 94.183.238.82 --country DE
+sh run.sh --country NL                  # Dutch sites from a Netherlands VPS
 sh run.sh --offset 300                 # Another batch of sites
 sh run.sh --domains my-domains.txt     # One domain per line
 sh run.sh --exclude excluded.txt       # One root domain per line
 sh run.sh --help
 ```
 
-For a single-file download after publishing, fetch `reality_sni_finder.py` from the repository and run `python3 reality_sni_finder.py`.
+For a single-file download, fetch `reality_sni_finder.py` from this repository and run `python3 reality_sni_finder.py`.
 
 ## How ranking works
 
