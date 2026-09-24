@@ -4,6 +4,7 @@
 import argparse
 import concurrent.futures
 import csv
+import email.utils
 import ipaddress
 import json
 import random
@@ -18,6 +19,26 @@ from pathlib import Path
 
 
 KNOWN_COUNTRIES = {"DE": "Q183", "NL": "Q55", "FI": "Q33", "SE": "Q34", "US": "Q30"}
+# Offline starting points when Wikidata Query Service is overloaded. These are
+# only candidates; every domain must still pass the regular network checks.
+FALLBACK_DOMAINS = {
+    "NL": [
+        "www.kerkrade.nl", "www.heerlen.nl", "www.gemeentemaastricht.nl",
+        "www.sittard-geleen.nl", "www.landgraaf.nl", "www.brunssum.nl",
+        "www.roermond.nl", "www.venlo.nl", "www.weert.nl",
+        "www.eindhoven.nl", "www.tilburg.nl", "www.breda.nl",
+        "www.delft.nl", "www.leiden.nl", "www.haarlem.nl",
+        "www.enschede.nl", "www.deventer.nl", "www.zwolle.nl",
+        "www.arnhem.nl", "www.nijmegen.nl", "www.groningen.nl",
+        "www.wageningen.nl", "www.middelburg.nl", "www.leeuwarden.nl",
+    ],
+    "DE": [
+        "www.bielefeld.de", "www.muenster.de", "www.dortmund.de",
+        "www.bochum.de", "www.essen.de", "www.duisburg.de",
+        "www.bonn.de", "www.aachen.de", "www.wuppertal.de",
+        "www.krefeld.de", "www.duesseldorf.de", "www.dresden.de",
+    ],
+}
 LARGE_DOMAINS = {
     "google.com", "google.de", "youtube.com", "facebook.com", "instagram.com",
     "cloudflare.com", "hetzner.com", "netcup.com", "microsoft.com",
@@ -33,6 +54,28 @@ def request_json(url, timeout):
     request = urllib.request.Request(url, headers={**HEADERS, "Accept": "application/json"})
     with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=timeout) as response:
         return json.load(response)
+
+
+def wikidata_json(url, timeout):
+    try:
+        return request_json(url, timeout)
+    except urllib.error.HTTPError as error:
+        if error.code != 429:
+            raise
+        retry_after = error.headers.get("Retry-After", "") if error.headers else ""
+        try:
+            delay = int(retry_after)
+        except (TypeError, ValueError):
+            try:
+                delay = int(email.utils.parsedate_to_datetime(retry_after).timestamp() - time.time()) + 1
+            except (TypeError, ValueError, OverflowError, IndexError):
+                delay = 60
+        # Respect long Retry-After values without keeping a terminal blocked indefinitely.
+        if not 0 <= delay <= 65:
+            raise
+        print(f"Wikidata rate limit (HTTP 429); waiting {delay} seconds before one retry...", flush=True)
+        time.sleep(delay)
+        return request_json(url, timeout)
 
 
 def network_info(ip, timeout):
@@ -81,7 +124,7 @@ def country_qid(country, timeout):
         return KNOWN_COUNTRIES[country]
     query = f'SELECT ?country WHERE {{ ?country wdt:P297 "{country}" . }} LIMIT 1'
     url = WIKIDATA + "?" + urllib.parse.urlencode({"query": query, "format": "json"})
-    rows = request_json(url, max(30, timeout))["results"]["bindings"]
+    rows = wikidata_json(url, max(30, timeout))["results"]["bindings"]
     if not rows:
         raise ValueError(f"No country in Wikidata for ISO code {country}; try --domains sites.txt")
     qid = rows[0]["country"]["value"].rsplit("/", 1)[-1]
@@ -91,16 +134,27 @@ def country_qid(country, timeout):
 
 
 def discover(country, limit, offset, timeout):
-    qid = country_qid(country, timeout)
-    query = (
-        "SELECT DISTINCT ?website WHERE { "
-        f"?org wdt:P17 wd:{qid} ; wdt:P856 ?website . "
-        'FILTER(STRSTARTS(STR(?website), "https://")) '
-        f"}} LIMIT {limit} OFFSET {offset}"
-    )
-    url = WIKIDATA + "?" + urllib.parse.urlencode({"query": query, "format": "json"})
-    data = request_json(url, max(40, timeout))
-    return [item["website"]["value"] for item in data["results"]["bindings"]]
+    try:
+        qid = country_qid(country, timeout)
+        query = (
+            "SELECT DISTINCT ?website WHERE { "
+            f"?org wdt:P17 wd:{qid} ; wdt:P856 ?website . "
+            'FILTER(STRSTARTS(STR(?website), "https://")) '
+            f"}} LIMIT {limit} OFFSET {offset}"
+        )
+        url = WIKIDATA + "?" + urllib.parse.urlencode({"query": query, "format": "json"})
+        data = wikidata_json(url, max(40, timeout))
+        return [item["website"]["value"] for item in data["results"]["bindings"]]
+    except (urllib.error.URLError, OSError) as error:
+        fallback = FALLBACK_DOMAINS.get(country)
+        if not fallback:
+            raise ValueError(
+                f"Wikidata discovery unavailable ({error}); pass --domains sites.txt "
+                "or retry after the service recovers"
+            ) from error
+        print(f"Wikidata unavailable ({error}); checking {len(fallback)} built-in "
+              f"{country} candidate domains instead.", flush=True)
+        return fallback
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
