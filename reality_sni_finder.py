@@ -5,14 +5,18 @@ import argparse
 import concurrent.futures
 import csv
 import email.utils
+import email.parser
 import hashlib
 import http.cookiejar
 import ipaddress
+import io
 import json
 import math
 import random
+import shutil
 import socket
 import ssl
+import subprocess
 import sys
 import time
 import tempfile
@@ -72,12 +76,46 @@ API_SESSION = urllib.request.build_opener(
 )
 CACHE_DIR = Path.home() / ".cache" / "ghostvpn-sni-finder"
 CACHE_TTL = 24 * 60 * 60
+QUERY_TRANSPORT = "python"
 
 
 def request_json(url, timeout, accept="application/json"):
     request = urllib.request.Request(url, headers={**HEADERS, "Accept": accept})
     with API_SESSION.open(request, timeout=timeout) as response:
         return json.load(response)
+
+
+def request_query_json(url, timeout):
+    """Optional curl transport matching the successful VPS IPv4 diagnostic."""
+    if QUERY_TRANSPORT != "curl":
+        return request_json(url, timeout, "application/sparql-results+json")
+    with tempfile.TemporaryDirectory(prefix="sni-query-") as directory:
+        body = Path(directory) / "body"
+        headers = Path(directory) / "headers"
+        command = [
+            "curl", "-q", "-4", "--http1.1", "--silent", "--show-error",
+            "--globoff", "--connect-timeout", str(min(timeout, 10)),
+            "--max-time", str(timeout),
+            "--user-agent", HEADERS["User-Agent"],
+            "--header", "Accept: application/sparql-results+json",
+            "--dump-header", str(headers), "--output", str(body),
+            "--write-out", "%{http_code}", "--url", url,
+        ]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout + 5)
+        except subprocess.TimeoutExpired as error:
+            raise OSError(f"curl query timed out after {timeout}s") from error
+        if result.returncode:
+            raise OSError(result.stderr.strip() or f"curl exit code {result.returncode}")
+        status = int(result.stdout.strip())
+        payload = body.read_bytes()
+        if status != 200:
+            # Take the last HTTP header block (a proxy may add a CONNECT response).
+            blocks = headers.read_text(encoding="iso-8859-1").strip().split("\n\n")
+            header_text = blocks[-1].partition("\n")[2]
+            parsed_headers = email.parser.Parser().parsestr(header_text)
+            raise urllib.error.HTTPError(url, status, "Query request failed", parsed_headers, io.BytesIO(payload))
+        return json.loads(payload)
 
 
 def query_cache_path(query):
@@ -98,7 +136,7 @@ def cached_bindings(query):
 
 
 def fetch_bindings(url, timeout, query):
-    rows = request_json(url, timeout, "application/sparql-results+json")["results"]["bindings"]
+    rows = request_query_json(url, timeout)["results"]["bindings"]
     if not isinstance(rows, list):
         raise ValueError("Unexpected SPARQL result format")
     temporary = None
@@ -130,19 +168,21 @@ def retry_after_delay(error):
             return 60
 
 
-def sparql_bindings(query, timeout):
+def sparql_bindings(query, timeout, skip_qlever=False):
     cached = cached_bindings(query)
     if cached is not None:
         print("Using cached discovery results (up to 24 hours old); sites will be checked again.", flush=True)
         return cached
     encoded = urllib.parse.urlencode({"query": SPARQL_PREFIXES + query})
     wikidata_url = WIKIDATA + "?" + encoded + "&format=json"
+    print(f"Querying Wikidata via {QUERY_TRANSPORT}; timeout {timeout}s...", flush=True)
     try:
         return fetch_bindings(wikidata_url, timeout, query)
     except (OSError, ValueError, KeyError) as primary:
-        print(f"Wikidata Query Service unavailable ({primary}); trying QLever...", flush=True)
+        print(f"Wikidata Query Service unavailable ({primary}).", flush=True)
         alternatives = []
-        for endpoint in QLEVER_ENDPOINTS:
+        for endpoint in (() if skip_qlever else QLEVER_ENDPOINTS):
+            print(f"Trying {endpoint}...", flush=True)
             try:
                 return fetch_bindings(endpoint + "?" + encoded, min(timeout, 20), query)
             except (OSError, ValueError, KeyError) as error:
@@ -157,7 +197,7 @@ def sparql_bindings(query, timeout):
                     return fetch_bindings(wikidata_url, timeout, query)
                 except (OSError, ValueError, KeyError) as error:
                     primary = error
-        raise OSError(f"Wikidata: {primary}; QLever: {'; '.join(alternatives)}")
+        raise OSError(f"Wikidata: {primary}; QLever: {'; '.join(alternatives) or 'skipped'}")
 
 
 def network_info(ip, timeout):
@@ -241,7 +281,7 @@ def discover_osm(server_ip, country, limit, timeout):
     return sorted(websites)
 
 
-def discover(country, limit, offset, timeout, server_ip=None):
+def discover(country, limit, offset, timeout, server_ip=None, discovery_timeout=60, skip_qlever=False):
     try:
         query = (
             "SELECT DISTINCT ?website WHERE { "
@@ -250,7 +290,7 @@ def discover(country, limit, offset, timeout, server_ip=None):
             'FILTER(STRSTARTS(STR(?website), "https://")) '
             f"}} LIMIT {limit} OFFSET {offset}"
         )
-        rows = sparql_bindings(query, max(40, timeout))
+        rows = sparql_bindings(query, discovery_timeout, skip_qlever)
         return [item["website"]["value"] for item in rows]
     except (urllib.error.URLError, OSError) as error:
         if server_ip:
@@ -272,15 +312,15 @@ def discover(country, limit, offset, timeout, server_ip=None):
         return fallback
 
 
-def diagnose_sources(timeout):
+def diagnose_sources(timeout, skip_qlever=False):
     query = SPARQL_PREFIXES + 'SELECT ?country WHERE { ?country wdt:P297 "TR" . } LIMIT 1'
     encoded = urllib.parse.urlencode({"query": query, "format": "json"})
     passed = 0
-    for endpoint in (WIKIDATA,) + QLEVER_ENDPOINTS:
-        print(f"\nTesting {endpoint}", flush=True)
+    for endpoint in (WIKIDATA,) + (() if skip_qlever else QLEVER_ENDPOINTS):
+        print(f"\nTesting {endpoint} via {QUERY_TRANSPORT}; timeout {timeout}s", flush=True)
         start = time.monotonic()
         try:
-            data = request_json(endpoint + "?" + encoded, timeout, "application/sparql-results+json")
+            data = request_query_json(endpoint + "?" + encoded, timeout)
             rows = data["results"]["bindings"]
             print(f"OK: {len(rows)} result(s), {time.monotonic() - start:.1f}s")
             passed += 1
@@ -388,6 +428,7 @@ def score(row, country):
 
 
 def main():
+    global QUERY_TRANSPORT
     parser = argparse.ArgumentParser(description="Discover and compare REALITY target/SNI candidates from a VPS")
     parser.add_argument("--server-ip", help="Public IPv4; detected automatically when omitted")
     parser.add_argument("--country", help="Override detected country with a two-letter ISO code, e.g. NL")
@@ -397,16 +438,25 @@ def main():
     parser.add_argument("--offset", type=int, default=0, help="Fetch another batch if results are sparse")
     parser.add_argument("--workers", type=int, default=4, help="Concurrent checks (default 4, max 8)")
     parser.add_argument("--timeout", type=int, default=7, help="Timeout per connection in seconds")
+    parser.add_argument("--discovery-timeout", type=int, default=60,
+                        help="Query timeout for discovery and --diagnose (default 60, range 20..120)")
+    parser.add_argument("--query-transport", choices=("python", "curl"), default="python",
+                        help="SPARQL client: Python (default) or curl over IPv4/HTTP1.1")
+    parser.add_argument("--skip-qlever", action="store_true", help="Skip QLever when unreachable from this VPS")
     parser.add_argument("--top", type=int, default=15, help="How many results to print")
     parser.add_argument("--output", help="Output CSV, default sni-results-IP.csv")
     parser.add_argument("--diagnose", action="store_true", help="Test query APIs once and print HTTP errors/Retry-After")
     args = parser.parse_args()
 
     if not (1 <= args.limit <= 2000 and 0 <= args.offset <= 100000 and
-            1 <= args.workers <= 8 and 2 <= args.timeout <= 30 and 1 <= args.top <= 100):
+            1 <= args.workers <= 8 and 2 <= args.timeout <= 30 and 1 <= args.top <= 100 and
+            20 <= args.discovery_timeout <= 120):
         parser.error("Limit, offset, workers, timeout or top is outside its allowed range")
+    QUERY_TRANSPORT = args.query_transport
+    if QUERY_TRANSPORT == "curl" and not shutil.which("curl"):
+        parser.error("curl is required for --query-transport curl; install it or use --query-transport python")
     if args.diagnose:
-        return diagnose_sources(max(10, args.timeout))
+        return diagnose_sources(args.discovery_timeout, args.skip_qlever)
     try:
         if args.server_ip:
             server_ip = args.server_ip
@@ -425,7 +475,8 @@ def main():
         print(f"GeoIP: {detected_country or '?'} {city or ''} | search country: {country or '?'}")
 
         candidates = read_domains(args.domains) if args.domains else discover(
-            country, args.limit, args.offset, args.timeout, server_ip
+            country, args.limit, args.offset, args.timeout, server_ip,
+            args.discovery_timeout, args.skip_qlever
         )
         excluded = set(LARGE_DOMAINS)
         if args.exclude:
