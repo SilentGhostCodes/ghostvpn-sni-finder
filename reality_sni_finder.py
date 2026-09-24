@@ -5,20 +5,23 @@ import argparse
 import concurrent.futures
 import csv
 import email.utils
+import hashlib
+import http.cookiejar
 import ipaddress
 import json
+import math
 import random
 import socket
 import ssl
 import sys
 import time
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 
-KNOWN_COUNTRIES = {"DE": "Q183", "NL": "Q55", "FI": "Q33", "SE": "Q34", "US": "Q30"}
 # Offline starting points when Wikidata Query Service is overloaded. These are
 # only candidates; every domain must still pass the regular network checks.
 FALLBACK_DOMAINS = {
@@ -38,27 +41,82 @@ FALLBACK_DOMAINS = {
         "www.bonn.de", "www.aachen.de", "www.wuppertal.de",
         "www.krefeld.de", "www.duesseldorf.de", "www.dresden.de",
     ],
+    "TR": [
+        "www.ankara.bel.tr", "www.yenimahalle.bel.tr", "www.cankaya.bel.tr",
+        "www.mamak.bel.tr", "www.kecioren.bel.tr", "www.ankara.edu.tr",
+        "www.hacettepe.edu.tr", "www.gazi.edu.tr", "www.odtu.edu.tr",
+        "www.tubitak.gov.tr", "www.etu.edu.tr", "www.etimesgut.bel.tr",
+    ],
 }
 LARGE_DOMAINS = {
     "google.com", "google.de", "youtube.com", "facebook.com", "instagram.com",
     "cloudflare.com", "hetzner.com", "netcup.com", "microsoft.com",
     "amazon.com", "wikipedia.org", "wikimedia.org", "apple.com",
 }
-HEADERS = {"User-Agent": "GhostVPN-SNI-Finder/1.0 (personal target research)"}
+HEADERS = {"User-Agent": "GhostVPN-SNI-Finder/1.1 (+https://github.com/SilentGhostCodes/ghostvpn-sni-finder)"}
 RIPE = "https://stat.ripe.net/data/"
 WIKIDATA = "https://query.wikidata.org/sparql"
-QLEVER = "https://qlever.dev/api/wikidata"
+QLEVER_ENDPOINTS = (
+    "https://qlever.dev/api/wikidata",
+    "https://qlever.cs.uni-freiburg.de/api/wikidata",
+)
+OVERPASS = "https://overpass.private.coffee/api/interpreter"
 SPARQL_PREFIXES = (
     "PREFIX wd: <http://www.wikidata.org/entity/> "
     "PREFIX wdt: <http://www.wikidata.org/prop/direct/> "
 )
 BYTES_TO_READ = 256 * 1024
+API_SESSION = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()),
+)
+CACHE_DIR = Path.home() / ".cache" / "ghostvpn-sni-finder"
+CACHE_TTL = 24 * 60 * 60
 
 
 def request_json(url, timeout, accept="application/json"):
     request = urllib.request.Request(url, headers={**HEADERS, "Accept": accept})
-    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=timeout) as response:
+    with API_SESSION.open(request, timeout=timeout) as response:
         return json.load(response)
+
+
+def query_cache_path(query):
+    return CACHE_DIR / (hashlib.sha256(query.encode("utf-8")).hexdigest() + ".json")
+
+
+def cached_bindings(query):
+    path = query_cache_path(query)
+    try:
+        if not 0 <= time.time() - path.stat().st_mtime < CACHE_TTL:
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(value, list) and all(isinstance(row, dict) for row in value):
+            return value
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def fetch_bindings(url, timeout, query):
+    rows = request_json(url, timeout, "application/sparql-results+json")["results"]["bindings"]
+    if not isinstance(rows, list):
+        raise ValueError("Unexpected SPARQL result format")
+    temporary = None
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=CACHE_DIR, delete=False) as output:
+            temporary = Path(output.name)
+            json.dump(rows, output)
+        temporary.replace(query_cache_path(query))
+    except OSError:
+        pass  # A read-only home directory must not prevent discovery.
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return rows
 
 
 def retry_after_delay(error):
@@ -73,24 +131,33 @@ def retry_after_delay(error):
 
 
 def sparql_bindings(query, timeout):
+    cached = cached_bindings(query)
+    if cached is not None:
+        print("Using cached discovery results (up to 24 hours old); sites will be checked again.", flush=True)
+        return cached
     encoded = urllib.parse.urlencode({"query": SPARQL_PREFIXES + query})
     wikidata_url = WIKIDATA + "?" + encoded + "&format=json"
-    qlever_url = QLEVER + "?" + encoded
     try:
-        return request_json(wikidata_url, timeout)["results"]["bindings"]
+        return fetch_bindings(wikidata_url, timeout, query)
     except (OSError, ValueError, KeyError) as primary:
         print(f"Wikidata Query Service unavailable ({primary}); trying QLever...", flush=True)
-        try:
-            return request_json(qlever_url, timeout, "application/sparql-results+json")["results"]["bindings"]
-        except (OSError, ValueError, KeyError) as alternative:
-            if isinstance(primary, urllib.error.HTTPError) and primary.code == 429:
-                delay = retry_after_delay(primary)
-                if 0 <= delay <= 65:
-                    print(f"QLever unavailable ({alternative}); waiting {delay} seconds "
-                          "before retrying Wikidata once...", flush=True)
-                    time.sleep(delay)
-                    return request_json(wikidata_url, timeout)["results"]["bindings"]
-            raise OSError(f"Wikidata: {primary}; QLever: {alternative}") from alternative
+        alternatives = []
+        for endpoint in QLEVER_ENDPOINTS:
+            try:
+                return fetch_bindings(endpoint + "?" + encoded, min(timeout, 20), query)
+            except (OSError, ValueError, KeyError) as error:
+                alternatives.append(str(error))
+        # Only one repeat request, respecting the service's rate-limit header.
+        if isinstance(primary, urllib.error.HTTPError) and primary.code in (429, 502, 503, 504):
+            delay = retry_after_delay(primary) if primary.code == 429 else 5
+            if 0 <= delay <= 65:
+                print(f"Other query endpoints unavailable; retrying Wikidata in {delay}s...", flush=True)
+                time.sleep(delay)
+                try:
+                    return fetch_bindings(wikidata_url, timeout, query)
+                except (OSError, ValueError, KeyError) as error:
+                    primary = error
+        raise OSError(f"Wikidata: {primary}; QLever: {'; '.join(alternatives)}")
 
 
 def network_info(ip, timeout):
@@ -134,40 +201,99 @@ def blocked(domain, excluded):
     return any(domain == root or domain.endswith("." + root) for root in excluded)
 
 
-def country_qid(country, timeout):
-    if country in KNOWN_COUNTRIES:
-        return KNOWN_COUNTRIES[country]
-    query = f'SELECT ?country WHERE {{ ?country wdt:P297 "{country}" . }} LIMIT 1'
-    rows = sparql_bindings(query, max(30, timeout))
-    if not rows:
-        raise ValueError(f"No country in Wikidata for ISO code {country}; try --domains sites.txt")
-    qid = rows[0]["country"]["value"].rsplit("/", 1)[-1]
-    if not qid.startswith("Q") or not qid[1:].isdigit():
-        raise ValueError(f"Unexpected Wikidata country identifier: {qid}")
-    return qid
+def discover_osm(server_ip, country, limit, timeout):
+    """Fetch a small sample of websites mapped near the VPS's GeoIP city."""
+    url = RIPE + "maxmind-geo-lite/data.json?" + urllib.parse.urlencode({"resource": server_ip})
+    data = request_json(url, timeout)["data"]
+    point = None
+    for resource in data.get("located_resources", []):
+        for loc in resource.get("locations", []):
+            if loc.get("country", "").upper() != country:
+                continue
+            try:
+                lat, lon = float(loc["latitude"]), float(loc["longitude"])
+                if math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180:
+                    point = (lat, lon)
+                    break
+            except (KeyError, TypeError, ValueError):
+                pass
+        if point:
+            break
+    if not point:
+        return []
+    lat, lon = point
+    result_limit = min(limit, 400)
+    query = (
+        f"[out:json][timeout:25];(nwr[\"website\"](around:30000,{lat},{lon});"
+        f"nwr[\"contact:website\"](around:30000,{lat},{lon}););out tags {result_limit};"
+    )
+    url = OVERPASS + "?" + urllib.parse.urlencode({"data": query})
+    elements = request_json(url, max(timeout, 30))["elements"]
+    websites = set()
+    for item in elements:
+        tags = item.get("tags", {})
+        for key in ("website", "contact:website"):
+            for value in tags.get(key, "").split(";"):
+                if value.strip():
+                    websites.add(value.strip())
+    print(f"OpenStreetMap: {len(websites)} websites mapped within 30 km of "
+          f"GeoIP coordinates {lat:.2f}, {lon:.2f} (approximate).", flush=True)
+    return sorted(websites)
 
 
-def discover(country, limit, offset, timeout):
+def discover(country, limit, offset, timeout, server_ip=None):
     try:
-        qid = country_qid(country, timeout)
         query = (
             "SELECT DISTINCT ?website WHERE { "
-            f"?org wdt:P17 wd:{qid} ; wdt:P856 ?website . "
+            f'?country wdt:P297 "{country}" . '
+            "?org wdt:P17 ?country ; wdt:P856 ?website . "
             'FILTER(STRSTARTS(STR(?website), "https://")) '
             f"}} LIMIT {limit} OFFSET {offset}"
         )
         rows = sparql_bindings(query, max(40, timeout))
         return [item["website"]["value"] for item in rows]
     except (urllib.error.URLError, OSError) as error:
+        if server_ip:
+            print(f"SPARQL discovery unavailable ({error}); trying OpenStreetMap...", flush=True)
+            try:
+                sites = discover_osm(server_ip, country, limit, timeout)
+                if sites:
+                    return sites + FALLBACK_DOMAINS.get(country, [])
+            except (OSError, ValueError, KeyError) as osm_error:
+                print(f"OpenStreetMap unavailable ({osm_error}).", flush=True)
         fallback = FALLBACK_DOMAINS.get(country)
         if not fallback:
             raise ValueError(
-                f"Wikidata and QLever discovery unavailable ({error}); pass --domains sites.txt "
+                f"Automatic discovery unavailable ({error}); pass --domains sites.txt "
                 "or retry after the service recovers"
             ) from error
-        print(f"Both discovery services unavailable ({error}); checking {len(fallback)} built-in "
+        print(f"Online discovery unavailable ({error}); checking {len(fallback)} built-in "
               f"{country} candidate domains instead.", flush=True)
         return fallback
+
+
+def diagnose_sources(timeout):
+    query = SPARQL_PREFIXES + 'SELECT ?country WHERE { ?country wdt:P297 "TR" . } LIMIT 1'
+    encoded = urllib.parse.urlencode({"query": query, "format": "json"})
+    passed = 0
+    for endpoint in (WIKIDATA,) + QLEVER_ENDPOINTS:
+        print(f"\nTesting {endpoint}", flush=True)
+        start = time.monotonic()
+        try:
+            data = request_json(endpoint + "?" + encoded, timeout, "application/sparql-results+json")
+            rows = data["results"]["bindings"]
+            print(f"OK: {len(rows)} result(s), {time.monotonic() - start:.1f}s")
+            passed += 1
+        except urllib.error.HTTPError as error:
+            retry = error.headers.get("Retry-After", "not provided") if error.headers else "not provided"
+            print(f"HTTP {error.code}; Retry-After: {retry}; {time.monotonic() - start:.1f}s")
+            try:
+                print(error.read(300).decode("utf-8", errors="replace"))
+            except OSError:
+                pass
+        except (OSError, ValueError, KeyError) as error:
+            print(f"Failed after {time.monotonic() - start:.1f}s: {error}")
+    return 0 if passed else 2
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -273,11 +399,14 @@ def main():
     parser.add_argument("--timeout", type=int, default=7, help="Timeout per connection in seconds")
     parser.add_argument("--top", type=int, default=15, help="How many results to print")
     parser.add_argument("--output", help="Output CSV, default sni-results-IP.csv")
+    parser.add_argument("--diagnose", action="store_true", help="Test query APIs once and print HTTP errors/Retry-After")
     args = parser.parse_args()
 
     if not (1 <= args.limit <= 2000 and 0 <= args.offset <= 100000 and
             1 <= args.workers <= 8 and 2 <= args.timeout <= 30 and 1 <= args.top <= 100):
         parser.error("Limit, offset, workers, timeout or top is outside its allowed range")
+    if args.diagnose:
+        return diagnose_sources(max(10, args.timeout))
     try:
         if args.server_ip:
             server_ip = args.server_ip
@@ -296,7 +425,7 @@ def main():
         print(f"GeoIP: {detected_country or '?'} {city or ''} | search country: {country or '?'}")
 
         candidates = read_domains(args.domains) if args.domains else discover(
-            country, args.limit, args.offset, args.timeout
+            country, args.limit, args.offset, args.timeout, server_ip
         )
         excluded = set(LARGE_DOMAINS)
         if args.exclude:
