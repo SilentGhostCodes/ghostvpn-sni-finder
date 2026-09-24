@@ -47,35 +47,50 @@ LARGE_DOMAINS = {
 HEADERS = {"User-Agent": "GhostVPN-SNI-Finder/1.0 (personal target research)"}
 RIPE = "https://stat.ripe.net/data/"
 WIKIDATA = "https://query.wikidata.org/sparql"
+QLEVER = "https://qlever.dev/api/wikidata"
+SPARQL_PREFIXES = (
+    "PREFIX wd: <http://www.wikidata.org/entity/> "
+    "PREFIX wdt: <http://www.wikidata.org/prop/direct/> "
+)
 BYTES_TO_READ = 256 * 1024
 
 
-def request_json(url, timeout):
-    request = urllib.request.Request(url, headers={**HEADERS, "Accept": "application/json"})
+def request_json(url, timeout, accept="application/json"):
+    request = urllib.request.Request(url, headers={**HEADERS, "Accept": accept})
     with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=timeout) as response:
         return json.load(response)
 
 
-def wikidata_json(url, timeout):
+def retry_after_delay(error):
+    value = error.headers.get("Retry-After", "") if error.headers else ""
     try:
-        return request_json(url, timeout)
-    except urllib.error.HTTPError as error:
-        if error.code != 429:
-            raise
-        retry_after = error.headers.get("Retry-After", "") if error.headers else ""
+        return int(value)
+    except (TypeError, ValueError):
         try:
-            delay = int(retry_after)
-        except (TypeError, ValueError):
-            try:
-                delay = int(email.utils.parsedate_to_datetime(retry_after).timestamp() - time.time()) + 1
-            except (TypeError, ValueError, OverflowError, IndexError):
-                delay = 60
-        # Respect long Retry-After values without keeping a terminal blocked indefinitely.
-        if not 0 <= delay <= 65:
-            raise
-        print(f"Wikidata rate limit (HTTP 429); waiting {delay} seconds before one retry...", flush=True)
-        time.sleep(delay)
-        return request_json(url, timeout)
+            return int(email.utils.parsedate_to_datetime(value).timestamp() - time.time()) + 1
+        except (TypeError, ValueError, OverflowError, IndexError):
+            return 60
+
+
+def sparql_bindings(query, timeout):
+    encoded = urllib.parse.urlencode({"query": SPARQL_PREFIXES + query})
+    wikidata_url = WIKIDATA + "?" + encoded + "&format=json"
+    qlever_url = QLEVER + "?" + encoded
+    try:
+        return request_json(wikidata_url, timeout)["results"]["bindings"]
+    except (OSError, ValueError, KeyError) as primary:
+        print(f"Wikidata Query Service unavailable ({primary}); trying QLever...", flush=True)
+        try:
+            return request_json(qlever_url, timeout, "application/sparql-results+json")["results"]["bindings"]
+        except (OSError, ValueError, KeyError) as alternative:
+            if isinstance(primary, urllib.error.HTTPError) and primary.code == 429:
+                delay = retry_after_delay(primary)
+                if 0 <= delay <= 65:
+                    print(f"QLever unavailable ({alternative}); waiting {delay} seconds "
+                          "before retrying Wikidata once...", flush=True)
+                    time.sleep(delay)
+                    return request_json(wikidata_url, timeout)["results"]["bindings"]
+            raise OSError(f"Wikidata: {primary}; QLever: {alternative}") from alternative
 
 
 def network_info(ip, timeout):
@@ -123,8 +138,7 @@ def country_qid(country, timeout):
     if country in KNOWN_COUNTRIES:
         return KNOWN_COUNTRIES[country]
     query = f'SELECT ?country WHERE {{ ?country wdt:P297 "{country}" . }} LIMIT 1'
-    url = WIKIDATA + "?" + urllib.parse.urlencode({"query": query, "format": "json"})
-    rows = wikidata_json(url, max(30, timeout))["results"]["bindings"]
+    rows = sparql_bindings(query, max(30, timeout))
     if not rows:
         raise ValueError(f"No country in Wikidata for ISO code {country}; try --domains sites.txt")
     qid = rows[0]["country"]["value"].rsplit("/", 1)[-1]
@@ -142,17 +156,16 @@ def discover(country, limit, offset, timeout):
             'FILTER(STRSTARTS(STR(?website), "https://")) '
             f"}} LIMIT {limit} OFFSET {offset}"
         )
-        url = WIKIDATA + "?" + urllib.parse.urlencode({"query": query, "format": "json"})
-        data = wikidata_json(url, max(40, timeout))
-        return [item["website"]["value"] for item in data["results"]["bindings"]]
+        rows = sparql_bindings(query, max(40, timeout))
+        return [item["website"]["value"] for item in rows]
     except (urllib.error.URLError, OSError) as error:
         fallback = FALLBACK_DOMAINS.get(country)
         if not fallback:
             raise ValueError(
-                f"Wikidata discovery unavailable ({error}); pass --domains sites.txt "
+                f"Wikidata and QLever discovery unavailable ({error}); pass --domains sites.txt "
                 "or retry after the service recovers"
             ) from error
-        print(f"Wikidata unavailable ({error}); checking {len(fallback)} built-in "
+        print(f"Both discovery services unavailable ({error}); checking {len(fallback)} built-in "
               f"{country} candidate domains instead.", flush=True)
         return fallback
 
